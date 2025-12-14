@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+
 import os
 import sys
 import shlex
 import subprocess
 import re
+from urllib.parse import urlparse
 
 RS = os.linesep  # equivalente di $RS / $INPUT_RECORD_SEPARATOR
+MAX_URL_LENGTH = 8192  # lunghezza massima sicura per URL
 
 
 def executable(*commands):
@@ -34,44 +37,70 @@ def halt(message):
 
 def with_command(command, fn):
     # equivalente di IO.popen(command, 'r+') che passa dalla shell
-    proc = subprocess.Popen(
-        command,
-        shell=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-
-    old_stdout = sys.stdout
-    sys.stdout = proc.stdin
+    proc = None
     try:
-        try:
-            fn()
-        except BrokenPipeError:
-            pass  # come rescue Errno::EPIPE => nil
-    finally:
-        sys.stdout = old_stdout
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
 
-    proc.stdin.close()
-    output = proc.stdout.read().splitlines()
-    proc.stdout.close()
-    proc.wait()
-    return output
+        old_stdout = sys.stdout
+        sys.stdout = proc.stdin
+        try:
+            try:
+                fn()
+            except BrokenPipeError:
+                pass  # come rescue Errno::EPIPE => nil
+        finally:
+            sys.stdout = old_stdout
+
+        proc.stdin.close()
+        output = proc.stdout.read().splitlines()
+        proc.stdout.close()
+        proc.wait()
+        return output
+    except Exception:
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        return []
 
 
 # TODO: Keep it simple for now
 def extract_urls(line):
-    return re.findall(
+    potential_urls = re.findall(
         r"(?:https?|file)://[-a-zA-Z0-9@:%_+.~#?&/=]+[-a-zA-Z0-9@%_+.~#?&/=!]+",
         line,
     )
+    # Valida e sanitizza gli URL
+    valid_urls = []
+    for url in potential_urls:
+        # Limita lunghezza URL
+        if len(url) > MAX_URL_LENGTH:
+            continue
+        # Valida che sia un URL parsabile
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme in ("http", "https", "file") and parsed.netloc or parsed.path:
+                valid_urls.append(url)
+        except Exception:
+            continue
+    return valid_urls
 
 
-lines = subprocess.check_output(
-    ["tmux", "capture-pane", "-J", "-p", "-S", "-99999"],
-    text=True,
-)
+try:
+    lines = subprocess.check_output(
+        ["tmux", "capture-pane", "-J", "-p", "-S", "-99999"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (subprocess.CalledProcessError, FileNotFoundError):
+    print("Error: tmux not available or not running in tmux session", file=sys.stderr)
+    sys.exit(1)
 
 urls = []
 for line in lines.splitlines():
@@ -87,11 +116,15 @@ if not urls:
 
 header = "Press CTRL-Y to copy URL to clipboard"
 
-client_size = subprocess.check_output(
-    ["tmux", "display-message", "-p", "#{client_width} #{client_height}"],
-    text=True,
-).split()
-max_size = list(map(int, client_size))
+try:
+    client_size = subprocess.check_output(
+        ["tmux", "display-message", "-p", "#{client_width} #{client_height}"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    ).split()
+    max_size = list(map(int, client_size))
+except (subprocess.CalledProcessError, ValueError):
+    max_size = [80, 24]  # fallback a dimensioni di default
 
 width = max(len(u) for u in urls + [header]) + 2 + 4 + 2
 height = len(urls) + 5 + 1 + 1
@@ -139,22 +172,39 @@ if selected[0] == "ctrl-y":
         halt("No command to control clipboard with")
 
     def copy():
-        sys.stdout.write("\n".join(selected[1:]).strip())
+        # Limita dimensione totale del testo copiato
+        text = "\n".join(selected[1:]).strip()
+        if len(text) > MAX_URL_LENGTH * 10:  # max 10 URL lunghi
+            text = text[: MAX_URL_LENGTH * 10]
+        sys.stdout.write(text)
 
-    with_command(copier, copy)
-    halt("Copied to clipboard")
+    result = with_command(copier, copy)
+    if result is not None:
+        halt("Copied to clipboard")
+    else:
+        halt("Error copying to clipboard")
 
 opener = executable("open", "xdg-open")
-if opener == "xdg-open":
-    opener = "nohup xdg-open"
 if not opener:
     halt("No command to open URL with")
 
+# Usa subprocess.run senza shell=True per evitare injection
 for url in selected[1:]:
-    # system "#{opener} url &> /dev/null" (sincrono)
-    subprocess.run(
-        f"{opener} {shlex.quote(url)}",
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        if opener == "open":
+            subprocess.run(
+                ["open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        elif opener == "xdg-open":
+            # xdg-open può essere lento, usa nohup per non bloccare
+            subprocess.Popen(
+                ["nohup", "xdg-open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass  # ignora errori nell'apertura di singoli URL
