@@ -7,11 +7,11 @@
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 conf() {
-  local value
-  value=$(tmux show -gqv "$1")
-  [ -n "$value" ] && echo "$value" || echo "$2"
+    local value
+    value=$(tmux show -gqv "$1")
+    [ -n "$value" ] && echo "$value" || echo "$2"
 }
 
 key="$(conf @fzf-url-bind u)"
 
-tmux bind-key "$key" run -b "$SCRIPT_DIR/fzf-url.rb";
+tmux bind-key "$key" run -b "$SCRIPT_DIR/fzf-url.py"
